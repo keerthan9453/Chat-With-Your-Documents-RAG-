@@ -38,8 +38,7 @@ def scan_docs_folder() -> dict:
             sections = extract_document(document_path.name, content)
             report["documents"].append({
                 "filename": document_path.name,
-                "sections_extracted": len(sections),
-                "sections": sections,
+                "sections_extracted": len(sections)
             })
         except Exception as exc:
             report["errors"].append(
