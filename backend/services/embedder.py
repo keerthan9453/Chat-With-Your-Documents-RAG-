@@ -15,23 +15,42 @@ if not api_key:
 co = cohere.ClientV2(api_key=api_key)
 
 
-def embed_chunks(chunks: list[dict]) -> list[dict]:
-    if not chunks:
-        return []
-
-    texts = [chunk["text"] for chunk in chunks]
-
+def embed_query(question: str) -> list[float]:
     response = co.embed(
         model="embed-v4.0",
-        texts=texts,
-        input_type="search_document",
+        texts=[question],
+        input_type="search_query",
         embedding_types=["float"],
         output_dimension=1024
     )
 
-    vectors = response.embeddings.float
+    return response.embeddings.float[0]
 
-    for chunk, vector in zip(chunks, vectors):
-        chunk["embedding"] = vector
+
+def embed_chunks(chunks: list[dict]) -> list[dict]:
+    if not chunks:
+        return []
+
+    batch_size = 32
+
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start:start + batch_size]
+        texts = [chunk["text"] for chunk in batch]
+
+        response = co.embed(
+            model="embed-v4.0",
+            texts=texts,
+            input_type="search_document",
+            embedding_types=["float"],
+            output_dimension=1024
+        )
+
+        vectors = response.embeddings.float
+
+        if len(vectors) != len(batch):
+            raise RuntimeError("Embedding count mismatch")
+
+        for chunk, vector in zip(batch, vectors):
+            chunk["embedding"] = vector
 
     return chunks

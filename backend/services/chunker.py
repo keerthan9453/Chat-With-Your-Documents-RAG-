@@ -25,10 +25,6 @@ def chunk_sections(
         # TODO 2: Calculate step size
         step_size = chunk_size - overlap
 
-        # TODO 3: Loop through text
-        # with overlapping windows
-        chunks.append(chunk)
-
         for i in range(0, len(text), step_size):
             if i + chunk_size >= len(text):
                 break
