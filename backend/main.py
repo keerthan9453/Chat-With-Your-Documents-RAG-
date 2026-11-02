@@ -1,4 +1,5 @@
 import logging
+from operator import le
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,6 +18,8 @@ from backend.services.extractor import extract_document
 from backend.services.keyword_search import keyword_search
 from backend.services.reranker import rerank_chunks
 from backend.services.hybrid_search import hybrid_search
+from backend.services.rewrite_query import rewrite_query
+from backend.evaluation.metrics import recall_at_k, reciprocal_rank
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 logger = logging.getLogger(__name__)
@@ -95,6 +98,14 @@ def search_match_list(question: str, top_k: int) -> list[dict]:
             results["distances"][0],
         )
     ]
+
+
+class EvaluationRequest(BaseModel):
+    question: str = Field(min_length=1)
+    relevant_ids: set[str] = Field(min_length=1)
+    retrieved_ids: list[str] = Field(min_length=1)
+    top_k: int = Field(default=5, ge=1, le=20)
+    rerand: bool = False
 
 
 class SearchRequest(BaseModel):
@@ -205,6 +216,32 @@ def search_documents(request: SearchRequest):
     except TooManyRequestsError as exc:
         raise HTTPException(
             status_code=429, detail="Cohere usage limit reached") from exc
+
+
+@app.potst("/evaluate")
+def evaluate_retrieval(request: EvaluationRequest):
+    try:
+        candidates = hybrid_search(
+            request.question, top_k=max(15, request.top_k))
+        if request.rerank:
+            matches = rerank_chunks(
+                request.question, candidates, top_n=request.top_k)
+        else:
+            matches = candidates[:request.top_k]
+        retrieved_ids = [match["id"] for match in matches]
+        recall = recall_at_k(
+            retrieved_ids, request.relevant_ids, request.top_k)
+        rr = reciprocal_rank(retrieved_ids, request.relevant_ids)
+    except TooManyRequestsError as exc:
+        raise HTTPException(
+            status_code=429, detail="Cohere usage limit reached") from exc
+    return {
+        "question": request.question,
+        "relevant_ids": list(request.relevant_ids),
+        "retrieved_ids": retrieved_ids,
+        "recall_at_k": recall,
+        "reciprocal_rank": rr
+    }
 
 
 @app.post("/search/advanced")
