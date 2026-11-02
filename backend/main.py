@@ -5,15 +5,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 import cohere
 import chromadb
-
+from backend.services.rewrite_query import rewrite_query
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, Field, model_validator
+from cohere.errors import TooManyRequestsError
 from backend.services.embedder import embed_chunks, embed_query, co
 from backend.services.ingestion import process_document
 from backend.services.vector_store import DB_PATH, search_vectors
 from backend.services.extractor import extract_document
+from backend.services.keyword_search import keyword_search
+from backend.services.reranker import rerank_chunks
+from backend.services.hybrid_search import hybrid_search
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 logger = logging.getLogger(__name__)
@@ -74,6 +77,43 @@ collection = chroma_client.get_or_create_collection(
 app = FastAPI(title="DocuMint AI", lifespan=lifespan)
 
 
+def search_match_list(question: str, top_k: int) -> list[dict]:
+    vector = embed_query(question)
+    results = search_vectors(vector, top_k)
+    return [
+        {
+            "id": chunk_id,
+            "text": text,
+            "filename": (meta or {}).get("filename"),
+            "page": (meta or {}).get("page"),
+            "distance": float(distance),
+        }
+        for chunk_id, text, meta, distance in zip(
+            results["ids"][0],
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        )
+    ]
+
+
+class SearchRequest(BaseModel):
+    question: str = Field(min_length=1)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class AdvancedSearchRequest(SearchRequest):
+    rewrite: bool = False
+    rerank: bool = True
+    candidate_k: int = Field(default=15, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def validate_candidates(self):
+        if self.top_k > self.candidate_k:
+            raise ValueError("top_k must not exceed candidate_k")
+        return self
+
+
 @app.get("/")
 async def get_startup_docs_report():
     return app.state.docs_report
@@ -124,37 +164,67 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
 
 
+# @app.post("/search")
+# def search_documents(request: SearchRequest):
+#     # Step 1: Convert the question into a vector
+#     query_vector = embed_query(request.question)
+
+#     # Step 2: Find the most relevant chunks
+#     results = search_vectors(
+#         query_vector,
+#         request.top_k
+#     )
+
+#     # Step 3: Return the matches
+#     matches = []
+
+#     for chunk_id, text, metadata, distance in zip(
+#         results["ids"][0],
+#         results["documents"][0],
+#         results["metadatas"][0],
+#         results["distances"][0]
+#     ):
+#         matches.append({
+#             "id": chunk_id,
+#             "text": text,
+#             "filename": metadata.get("filename"),
+#             "page": metadata.get("page"),
+#             "distance": distance
+#         })
+
+#     return {
+#         "question": request.question,
+#         "matches": matches
+#     }
+
+
 @app.post("/search")
 def search_documents(request: SearchRequest):
-    # Step 1: Convert the question into a vector
-    query_vector = embed_query(request.question)
+    try:
+        return {"question": request.question, "matches": search_match_list(request.question, request.top_k)}
+    except TooManyRequestsError as exc:
+        raise HTTPException(
+            status_code=429, detail="Cohere usage limit reached") from exc
 
-    # Step 2: Find the most relevant chunks
-    results = search_vectors(
-        query_vector,
-        request.top_k
-    )
 
-    # Step 3: Return the matches
-    matches = []
-
-    for chunk_id, text, metadata, distance in zip(
-        results["ids"][0],
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0]
-    ):
-        matches.append({
-            "id": chunk_id,
-            "text": text,
-            "filename": metadata.get("filename"),
-            "page": metadata.get("page"),
-            "distance": distance
-        })
-
+@app.post("/search/advanced")
+def advanced_search(request: AdvancedSearchRequest):
+    try:
+        search_query = rewrite_query(
+            request.question) if request.rewrite else request.question
+        candidates = hybrid_search(search_query, top_k=request.candidate_k)
+        matches = (
+            rerank_chunks(request.question, candidates, top_n=request.top_k)
+            if request.rerank else candidates[:request.top_k]
+        )
+    except TooManyRequestsError as exc:
+        raise HTTPException(
+            status_code=429, detail="Cohere usage limit reached") from exc
     return {
-        "question": request.question,
-        "matches": matches
+        "original_query": request.question,
+        "search_query": search_query,
+        "candidates_found": len(candidates),
+        "matches": matches,
     }
 
 
